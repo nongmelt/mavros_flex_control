@@ -1,0 +1,1 @@
+ros2 run topic_tools relay /vicon/drone/drone /mavros/mocap/pose

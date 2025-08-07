@@ -1,0 +1,3 @@
+[submodule "ros2-vicon-bridge"]
+	path = ros2-vicon-bridge
+	url = https://github.com/dasc-lab/ros2-vicon-bridge.git
