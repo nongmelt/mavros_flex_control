@@ -11,7 +11,7 @@ def generate_launch_description():
         # Launch arguments
         DeclareLaunchArgument(
             'vicon_hostname',
-            default_value='192.168.0.51:801',
+            default_value='192.168.0.50:801',
             description='VICON DataStream server hostname:port'
         ),
         DeclareLaunchArgument(
@@ -21,7 +21,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'fcu_url',
-            default_value='/dev/ttyAMA0:115200',
+            default_value='/dev/ttyAMA0:921600',
             description='FCU connection URL'
         ),
         DeclareLaunchArgument(
