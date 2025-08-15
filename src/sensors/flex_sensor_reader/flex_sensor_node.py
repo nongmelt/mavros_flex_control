@@ -18,7 +18,7 @@ class FlexSensorReader(Node):
         # Initialize I2C and ADS1115
         try:
             self.i2c = busio.I2C(board.SCL, board.SDA)
-            self.ads = ADS.ADS1115(self.i2c)
+            self.ads = ADS.ADS1115(self.i2c, data_rate=860)
 
             # Initialize analog input channels for 4 flex sensors
             self.channels = [
