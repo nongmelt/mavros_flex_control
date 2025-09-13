@@ -109,7 +109,7 @@ def generate_launch_description():
     
     yaw_kp_arg = DeclareLaunchArgument(
         'yaw_kp',
-        default_value='0.05',
+        default_value='0.03',
         description='Yaw PID proportional gain'
     )
     
@@ -140,7 +140,7 @@ def generate_launch_description():
     
     deadzone_threshold_arg = DeclareLaunchArgument(
         'deadzone_threshold',
-        default_value='0.05',
+        default_value='150.0',
         description='Deadzone threshold for flex sensor input'
     )
     

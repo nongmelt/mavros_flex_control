@@ -34,9 +34,9 @@ class FlexSensorReader(Node):
             self.get_logger().error(f"Failed to initialize ADS1115: {str(e)}")
             return
 
-        # Create publisher for flex sensor data
+        # Create publisher for flex sensor data using ChannelFloat32 (includes header with timestamp)
         self.publisher_ = self.create_publisher(
-            Float32MultiArray, "flex_sensors/raw", 50
+            ChannelFloat32, "flex_sensors/raw", 50
         )
 
         # Create timer for publishing sensor data
@@ -46,6 +46,9 @@ class FlexSensorReader(Node):
         # Parameters
         self.declare_parameter("reference_voltage", 3.3)
         self.declare_parameter("divider_resistance", 47000.0)  # 47K ohm
+
+        # Initialize sequence counter for header
+        self.sequence_counter = 0
 
         self.get_logger().info("Flex sensor reader node initialized")
 
@@ -79,18 +82,35 @@ class FlexSensorReader(Node):
                         f"Sensor {i}: {voltage:.3f}V, {flex_resistance:.0f}Ω"
                     )
 
-            # Create and publish message
-            msg = Float32MultiArray()
-            msg.data = resistance_values
+            # Create message with header (includes timestamp)
+            msg = ChannelFloat32()
+            
+            # Create and populate header with timestamp
+            msg.header = Header()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = "flex_sensors"
+            msg.header.seq = self.sequence_counter
+            self.sequence_counter += 1
+
+            # Set the sensor data
+            msg.name = "flex_sensor_resistance"
+            msg.values = resistance_values
 
             self.publisher_.publish(msg)
 
         except Exception as e:
             self.get_logger().error(f"Error reading sensors: {str(e)}")
 
-            # Publish error message
-            msg = Float32MultiArray()
-            msg.data = [0.0, 0.0, 0.0, 0.0]
+            # Publish error message with timestamp
+            msg = ChannelFloat32()
+            msg.header = Header()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = "flex_sensors"
+            msg.header.seq = self.sequence_counter
+            self.sequence_counter += 1
+            
+            msg.name = "flex_sensor_resistance"
+            msg.values = [0.0, 0.0, 0.0, 0.0]
 
             self.publisher_.publish(msg)
 

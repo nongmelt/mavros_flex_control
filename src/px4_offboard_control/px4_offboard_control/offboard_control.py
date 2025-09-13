@@ -13,7 +13,8 @@ from rclpy.qos import (
 
 # MAVROS messages and services
 from mavros_msgs.msg import State, AttitudeTarget
-from mavros_msgs.srv import CommandBool, SetMode
+from mavros_msgs.srv import CommandBool, SetMode, ParamGet, ParamSet
+from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from std_msgs.msg import Header, Float32MultiArray, Float32
 from scipy.spatial.transform import Rotation as R
@@ -132,7 +133,7 @@ class FlexOffboardControl(Node):
         self.target_velocity_z = 0.0  # Up/down velocity in m/s
 
         # Flight state machine
-        self.flight_state = "INIT"
+        self.flight_state = "FLEX_CONTROL"
         self.takeoff_complete = False
         self.hover_timer = 0
         self.hover_duration = int(hover_time / self.dt)
@@ -191,7 +192,12 @@ class FlexOffboardControl(Node):
         self.velocity_pub = self.create_publisher(
             TwistStamped,
             f"{self.namespace_prefix}/mavros/setpoint_velocity/cmd_vel",
-            qos_profile_pub,
+            QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10,
+            ),
         )
 
         # Debug publishers
@@ -222,6 +228,24 @@ class FlexOffboardControl(Node):
         self.set_mode_client = self.create_client(
             SetMode, f"{self.namespace_prefix}/mavros/set_mode"
         )
+        
+        self.param_get_client = self.create_client(
+            ParamGet, f"{self.namespace_prefix}/mavros/param/get"
+        )
+        self.param_set_client = self.create_client(
+            ParamSet, f"{self.namespace_prefix}/mavros/param/set"
+        )
+        
+        # Store original I gains to restore later
+        self.original_i_gains = {}
+        self.i_gains_modified = False
+        
+        # Rate controller I gain parameter names for PX4
+        self.rate_i_params = [
+            "MC_ROLLRATE_I",   # Roll rate I gain
+            "MC_PITCHRATE_I",  # Pitch rate I gain
+            "MC_YAWRATE_I"     # Yaw rate I gain
+        ]
 
         # Wait for services
         self.get_logger().info("Waiting for MAVROS services...")
@@ -266,6 +290,134 @@ class FlexOffboardControl(Node):
         self.get_logger().info(f"  - Control mode: {'Velocity' if self.use_velocity_control else 'Attitude'}")
         if self.use_velocity_control:
             self.get_logger().info(f"  - Max velocities: X={self.max_velocity_x}m/s, Y={self.max_velocity_y}m/s, Z={self.max_velocity_z}m/s")
+    
+    def apply_deadzone(self, error, deadzone_size):
+        if (abs(error) < deadzone_size):
+            return 0.0
+        elif (error > deadzone_size):
+            return error - deadzone_size
+        else:
+            return error + deadzone_size
+        
+    def get_px4_parameter(self, param_name):
+        """Get a PX4 parameter value"""
+        if not self.param_get_client.service_is_ready():
+            self.get_logger().warn("Parameter get service not ready")
+            return None
+            
+        req = ParamGet.Request()
+        req.param_id = param_name
+        
+        try:
+            future = self.param_get_client.call_async(req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+            
+            if future.result() is not None:
+                response = future.result()
+                if response.success:
+                    if response.value.integer != 0:
+                        return float(response.value.integer)
+                    else:
+                        return response.value.real
+                else:
+                    self.get_logger().warn(f"Failed to get parameter {param_name}")
+                    return None
+            else:
+                self.get_logger().warn(f"Timeout getting parameter {param_name}")
+                return None
+                
+        except Exception as e:
+            self.get_logger().error(f"Error getting parameter {param_name}: {str(e)}")
+            return None
+    
+    def set_px4_parameter(self, param_name, value):
+        """Set a PX4 parameter value"""
+        if not self.param_set_client.service_is_ready():
+            self.get_logger().warn("Parameter set service not ready")
+            return False
+            
+        req = ParamSet.Request()
+        req.param_id = param_name
+        
+        # Set parameter value (PX4 parameters are typically float)
+        req.value.integer = 0
+        req.value.real = float(value)
+        
+        try:
+            future = self.param_set_client.call_async(req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+            
+            if future.result() is not None:
+                response = future.result()
+                if response.success:
+                    self.get_logger().info(f"Successfully set {param_name} = {value}")
+                    return True
+                else:
+                    self.get_logger().warn(f"Failed to set parameter {param_name} = {value}")
+                    return False
+            else:
+                self.get_logger().warn(f"Timeout setting parameter {param_name}")
+                return False
+                
+        except Exception as e:
+            self.get_logger().error(f"Error setting parameter {param_name}: {str(e)}")
+            return False
+    
+    def backup_and_disable_rate_i_gains(self):
+        """Backup original I gains and set them to zero"""
+        if self.i_gains_modified:
+            self.get_logger().info("Rate I gains already modified")
+            return True
+            
+        self.get_logger().info("Backing up and disabling rate controller I gains...")
+        
+        success = True
+        for param_name in self.rate_i_params:
+            # Get original value
+            original_value = self.get_px4_parameter(param_name)
+            if original_value is not None:
+                self.original_i_gains[param_name] = original_value
+                self.get_logger().info(f"Backed up {param_name}: {original_value}")
+                
+                # Set to zero
+                if self.set_px4_parameter(param_name, 0.0):
+                    self.get_logger().info(f"Disabled {param_name} (set to 0.0)")
+                else:
+                    success = False
+            else:
+                self.get_logger().error(f"Failed to backup {param_name}")
+                success = False
+        
+        if success:
+            self.i_gains_modified = True
+            self.get_logger().info("✅ All rate controller I gains disabled for flex control")
+        else:
+            self.get_logger().error("❌ Failed to disable some rate controller I gains")
+            
+        return success
+    
+    def restore_rate_i_gains(self):
+        """Restore original I gains"""
+        if not self.i_gains_modified:
+            self.get_logger().info("Rate I gains not modified, nothing to restore")
+            return True
+            
+        self.get_logger().info("Restoring original rate controller I gains...")
+        
+        success = True
+        for param_name, original_value in self.original_i_gains.items():
+            if self.set_px4_parameter(param_name, original_value):
+                self.get_logger().info(f"Restored {param_name}: {original_value}")
+            else:
+                success = False
+        
+        if success:
+            self.i_gains_modified = False
+            self.get_logger().info("✅ All rate controller I gains restored")
+        else:
+            self.get_logger().error("❌ Failed to restore some rate controller I gains")
+            
+        return success
 
     def flex_sensor_callback(self, msg):
         """Process flex sensor data from Float32MultiArray"""
@@ -283,10 +435,8 @@ class FlexOffboardControl(Node):
             self.flex_yaw_input = self.flex_channel_1 - self.flex_channel_2
             
             # Apply deadzone to reduce noise
-            if abs(self.flex_pitch_input) < self.deadzone_threshold:
-                self.flex_pitch_input = 0.0
-            if abs(self.flex_yaw_input) < self.deadzone_threshold:
-                self.flex_yaw_input = 0.0
+            self.flex_pitch_input = self.apply_deadzone(self.flex_pitch_input, self.deadzone_threshold)
+            self.flex_yaw_input = self.apply_deadzone(self.flex_yaw_input, self.deadzone_threshold)
             
             # Publish debug information
             pitch_debug_msg = Float32()
@@ -626,6 +776,8 @@ class FlexOffboardControl(Node):
 
         elif self.flight_state == "FLEX_CONTROL":
             # Log status occasionally
+            # if self.enable_flex_control:
+            #     self.backup_and_disable_rate_i_gains()
             if self.setpoint_counter % 250 == 0:  # Every 5 seconds
                 current_alt = self.current_pose.pose.position.z
                 if self.use_velocity_control:
@@ -653,6 +805,14 @@ class FlexOffboardControl(Node):
                 f"State: {self.flight_state}, Mode: {self.current_state.mode}, "
                 f"Armed: {self.armed}, Alt: {current_alt:.2f}m"
             )
+    # def destroy_node(self):
+    #     """Clean up when shutting down"""
+    #     # Restore I gains before shutting down
+    #     if self.i_gains_modified:
+    #         self.get_logger().info("Restoring rate controller I gains before shutdown...")
+    #         self.restore_rate_i_gains()
+        
+    #     super().destroy_node()
 
 
 def main(args=None):

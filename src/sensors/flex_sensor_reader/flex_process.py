@@ -6,6 +6,7 @@ from std_msgs.msg import Float32MultiArray, Float32
 from collections import deque
 import numpy as np
 from scipy import signal
+from scipy.ndimage import gaussian_filter1d
 
 
 class FlexSensorProcessor(Node):
@@ -17,10 +18,12 @@ class FlexSensorProcessor(Node):
         self.declare_parameter("output_topic", "flex_sensors/processed")
         self.declare_parameter("buffer_size", 10)
         self.declare_parameter("sampling_rate", 50.0)  # Match your publisher rate
+        self.declare_parameter("butterworth_deg", 1)
         self.declare_parameter("cutoff_frequency", 10.0)  # Lower for 50Hz sampling
         self.declare_parameter("enable_calibration", True)
         self.declare_parameter("calibration_samples", 500)
         self.declare_parameter("enable_filter", True)
+        self.declare_parameter("enable_gaussian_filter", True)
         self.declare_parameter("enable_drift_compensation", True)  # Handle TPU creep
         self.declare_parameter(
             "drift_update_rate", 0.005
@@ -31,9 +34,6 @@ class FlexSensorProcessor(Node):
         self.declare_parameter(
             "drift_window_size", 50
         )  # Smaller window for faster response
-        self.declare_parameter("enable_median_filter", True)
-        self.declare_parameter("median_window", 3)
-        self.declare_parameter("median_filter_size", 10)  # Median filter size
 
         # Get parameters
         self.input_topic = (
@@ -48,8 +48,14 @@ class FlexSensorProcessor(Node):
         self.sampling_rate = (
             self.get_parameter("sampling_rate").get_parameter_value().double_value
         )
+        self.butterworth_deg = (
+            self.get_parameter("butterworth_deg").get_parameter_value().integer_value
+        )
         self.cutoff_freq = (
             self.get_parameter("cutoff_frequency").get_parameter_value().double_value
+        )
+        self.enable_gaussian_filter = (
+            self.get_parameter("enable_gaussian_filter").get_parameter_value().bool_value
         )
         self.enable_calibration = (
             self.get_parameter("enable_calibration").get_parameter_value().bool_value
@@ -75,15 +81,6 @@ class FlexSensorProcessor(Node):
         )
         self.drift_window_size = (
             self.get_parameter("drift_window_size").get_parameter_value().integer_value
-        )
-        self.enable_median_filter = (
-            self.get_parameter("enable_median_filter").get_parameter_value().bool_value
-        )
-        self.median_window = (
-            self.get_parameter("median_window").get_parameter_value().integer_value
-        )
-        self.median_filter_size = (
-            self.get_parameter("median_filter_size").get_parameter_value().integer_value
         )
         # Initialize data structures
         self.num_sensors = 4
@@ -118,7 +115,7 @@ class FlexSensorProcessor(Node):
             nyquist = self.sampling_rate / 2
             normalized_cutoff = self.cutoff_freq / nyquist
             self.filter_b, self.filter_a = signal.butter(
-                1, normalized_cutoff, btype="low"
+                self.butterworth_deg, normalized_cutoff, btype="low"
             )
 
             # Initialize filter states for each sensor
@@ -144,16 +141,12 @@ class FlexSensorProcessor(Node):
             Float32MultiArray, "flex_sensors/stage_1b_drift_compensation", 10
         )
 
-        self.median_publisher = self.create_publisher(
-            Float32MultiArray, "flex_sensors/stage_1c_median_filter", 10
-        )
-
         self.filtered_publisher = self.create_publisher(
             Float32MultiArray, "flex_sensors/stage_2_filtered", 10
         )
 
-        self.smoothed_publisher = self.create_publisher(
-            Float32MultiArray, "flex_sensors/stage_3_smoothed", 10
+        self.gaussian_publisher = self.create_publisher(
+            Float32MultiArray, "flex_sensors/stage_3_gaussian", 10
         )
 
         # Publishers for flex sensor signals
@@ -166,34 +159,31 @@ class FlexSensorProcessor(Node):
         # )
 
         # Statistics publisher (optional)
-        self.stats_publisher = self.create_publisher(
-            Float32MultiArray, "flex_sensors/statistics", 10
-        )
+        # self.stats_publisher = self.create_publisher(
+        #     Float32MultiArray, "flex_sensors/statistics", 10
+        # )
 
         # Create timer for statistics publishing
-        self.stats_timer = self.create_timer(1.0, self.publish_statistics)
+        # self.stats_timer = self.create_timer(1.0, self.publish_statistics)
 
         self.get_logger().info("Flex sensor processor initialized")
         self.get_logger().info(f"Subscribing to: {self.input_topic}")
         self.get_logger().info(f"Publishing to: {self.output_topic}")
+        self.get_logger().info(f"Cutoff freq: {self.cutoff_freq}, Normalised: {normalized_cutoff}")
+        self.get_logger().info(f"Butterworth Degree: {self.butterworth_deg}")
         
         if self.enable_drift_compensation:
             self.get_logger().info(
                 f"Drift compensation enabled: update_rate={self.drift_update_rate:.4f}, threshold={self.drift_threshold:.0f}Ω, window={self.drift_window_size} samples"
-            )
-        if self.enable_median_filter:
-            self.get_logger().info(
-                f"Median filter enabled: window_size={self.median_window:.3f}"
             )
         self.get_logger().info("Progressive stage topics:")
         self.get_logger().info("  - flex_sensors/stage_0_raw")
         self.get_logger().info("  - flex_sensors/stage_1_baseline_removed")
         if self.enable_drift_compensation:
             self.get_logger().info("  - flex_sensors/stage_1b_drift_compensation")
-        if self.enable_median_filter:
-            self.get_logger().info("  - flex_sensors/stage_1c_median_filter")
         self.get_logger().info("  - flex_sensors/stage_2_filtered")
-        self.get_logger().info("  - flex_sensors/stage_3_smoothed")
+        if self.enable_gaussian_filter:
+            self.get_logger().info("  - flex_sensors/stage_3_gaussian_filter")
 
         if self.is_calibrating:
             self.get_logger().info(
@@ -328,43 +318,59 @@ class FlexSensorProcessor(Node):
                 self.drift_compensation_publisher,
                 "Drift Compensation",
             )
-
-        # Stage 1c: Apply median filter to remove spikes
-        if self.enable_median_filter:
-            processed_data = self.apply_median_filter(processed_data)
-            self.publish_stage_data(
-                processed_data, self.median_publisher, "Median Filtered"
-            )
-
-        # Stage 2: Apply digital filter
-        if self.enable_filter:
-            processed_data = self.apply_filter(processed_data)
-        self.publish_stage_data(processed_data, self.filtered_publisher, "Filtered")
-
-        # Stage 3: Store in buffers for additional processing
+        
         for i, value in enumerate(processed_data):
             self.data_buffers[i].append(value)
 
+        # Stage 2: Apply digital filter
+        if self.enable_filter:
+            if self.enable_gaussian_filter:
+                processed_data = self.apply_gaussian_filter(processed_data)
+                self.publish_stage_data(processed_data, self.gaussian_publisher, "Gaussian")
+            else:
+                processed_data = self.apply_filter(processed_data)
+                self.publish_stage_data(processed_data, self.filtered_publisher, "Filtered")
+
         # Stage 4: Apply additional smoothing
-        processed_data = self.apply_smoothing(processed_data)
-        self.publish_stage_data(processed_data, self.smoothed_publisher, "Smoothed")
+        # processed_data = self.apply_smoothing(processed_data)
+        # self.publish_stage_data(processed_data, self.smoothed_publisher, "Smoothed")
 
         return processed_data
 
-    def apply_smoothing(self, data):
-        """Apply moving average smoothing"""
-        smoothed_data = []
+    # def apply_smoothing(self, data):
+    #     """Apply moving average smoothing"""
+    #     smoothed_data = []
 
+    #     for i, current_value in enumerate(data):
+    #         if len(self.data_buffers[i]) >= 3:  # Need at least 3 samples
+    #             # Simple moving average
+    #             buffer_array = np.array(list(self.data_buffers[i]))
+    #             smoothed_value = np.mean(buffer_array[-3:])  # Last 3 samples
+    #             smoothed_data.append(smoothed_value)
+    #         else:
+    #             smoothed_data.append(current_value)
+
+    #     return smoothed_data
+    def apply_gaussian_filter(self, data):
+        """Apply Gaussian filter"""
+        filtered_data = []
+        sigma = 3
         for i, current_value in enumerate(data):
-            if len(self.data_buffers[i]) >= 3:  # Need at least 3 samples
+            if len(self.data_buffers[i]) >= sigma*5:  # Need at least 15 samples
                 # Simple moving average
                 buffer_array = np.array(list(self.data_buffers[i]))
-                smoothed_value = np.mean(buffer_array[-3:])  # Last 3 samples
-                smoothed_data.append(smoothed_value)
+            
+                # Apply 1D Gaussian filter with sigma = 3
+                filtered_buffer = gaussian_filter1d(buffer_array, sigma=3)
+                
+                # Take the last (most recent) filtered value
+                filtered_value = filtered_buffer[-1]
             else:
-                smoothed_data.append(current_value)
+                # Not enough samples yet, use raw value
+                filtered_value = current_value
+            filtered_data.append(float(filtered_value))
 
-        return smoothed_data
+        return filtered_data
 
     def apply_filter(self, data):
         """Apply Butterworth low-pass filter"""
@@ -379,43 +385,43 @@ class FlexSensorProcessor(Node):
 
         return filtered_data
 
-    def publish_statistics(self):
-        """Publish statistics about the sensor data"""
-        if not self.raw_data_history[0] or len(self.raw_data_history[0]) < 10:
-            return
+    # def publish_statistics(self):
+    #     """Publish statistics about the sensor data"""
+    #     if not self.raw_data_history[0] or len(self.raw_data_history[0]) < 10:
+    #         return
 
-        stats_data = []
+    #     stats_data = []
 
-        for i in range(self.num_sensors):
-            if len(self.raw_data_history[i]) > 0:
-                data_array = np.array(list(self.raw_data_history[i]))
-                mean_val = np.mean(data_array)
-                std_val = np.std(data_array)
-                min_val = np.min(data_array)
-                max_val = np.max(data_array)
+    #     for i in range(self.num_sensors):
+    #         if len(self.raw_data_history[i]) > 0:
+    #             data_array = np.array(list(self.raw_data_history[i]))
+    #             mean_val = np.mean(data_array)
+    #             std_val = np.std(data_array)
+    #             min_val = np.min(data_array)
+    #             max_val = np.max(data_array)
 
-                # Pack stats as [mean, std, min, max] for each sensor
-                stats_data.extend([mean_val, std_val, min_val, max_val])
+    #             # Pack stats as [mean, std, min, max] for each sensor
+    #             stats_data.extend([mean_val, std_val, min_val, max_val])
 
-        if stats_data:
-            stats_msg = Float32MultiArray()
-            stats_msg.data = stats_data
-            self.stats_publisher.publish(stats_msg)
+        # if stats_data:
+        #     stats_msg = Float32MultiArray()
+        #     stats_msg.data = stats_data
+        #     self.stats_publisher.publish(stats_msg)
 
-    def get_sensor_statistics(self):
-        """Get current sensor statistics"""
-        stats = {}
-        for i in range(self.num_sensors):
-            if len(self.raw_data_history[i]) > 0:
-                data = np.array(list(self.raw_data_history[i]))
-                stats[f"sensor_{i}"] = {
-                    "mean": np.mean(data),
-                    "std": np.std(data),
-                    "min": np.min(data),
-                    "max": np.max(data),
-                    "samples": len(data),
-                }
-        return stats
+    # def get_sensor_statistics(self):
+    #     """Get current sensor statistics"""
+    #     stats = {}
+    #     for i in range(self.num_sensors):
+    #         if len(self.raw_data_history[i]) > 0:
+    #             data = np.array(list(self.raw_data_history[i]))
+    #             stats[f"sensor_{i}"] = {
+    #                 "mean": np.mean(data),
+    #                 "std": np.std(data),
+    #                 "min": np.min(data),
+    #                 "max": np.max(data),
+    #                 "samples": len(data),
+    #             }
+    #     return stats
 
     def publish_stage_data(self, data, publisher, stage_name):
         """Publish data from a specific processing stage"""
