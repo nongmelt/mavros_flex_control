@@ -2,18 +2,41 @@
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray, Header
-from sensor_msgs.msg import ChannelFloat32
+from std_msgs.msg import Header
 import board
 import busio
 import adafruit_ads1x15.ads1115 as ADS
 from adafruit_ads1x15.analog_in import AnalogIn
+import numpy as np
+import random
 import time
+
+from flex_sensor_reader.msg import FlexSensorData
 
 
 class FlexSensorReader(Node):
     def __init__(self):
         super().__init__("flex_sensor_reader")
+
+        # Parameters
+        self.declare_parameter("reference_voltage", 3.3)
+        self.declare_parameter("divider_resistance", 47000.0)  # 47K ohm
+        self.declare_parameter("sim", False)
+
+        self.sim = self.get_parameter("sim").get_parameter_value().bool_value
+
+        if self.sim:
+            # Create timer for publishing sensor data
+            self.timer_period = 0.02  # 50 Hz
+            self.timer = self.create_timer(
+                self.timer_period, self.random_and_publish_sensors
+            )
+            self.publisher_ = self.create_publisher(
+                FlexSensorData, "flex_sensors/raw", 50
+            )
+            self.get_logger().info("Flex sensor random node initialized")
+
+            return
 
         # Initialize I2C and ADS1115
         try:
@@ -34,23 +57,41 @@ class FlexSensorReader(Node):
             self.get_logger().error(f"Failed to initialize ADS1115: {str(e)}")
             return
 
-        # Create publisher for flex sensor data using ChannelFloat32 (includes header with timestamp)
-        self.publisher_ = self.create_publisher(
-            ChannelFloat32, "flex_sensors/raw", 50
-        )
+        self.publisher_ = self.create_publisher(FlexSensorData, "flex_sensors/raw", 50)
 
         # Create timer for publishing sensor data
         self.timer_period = 0.02  # 50 Hz
         self.timer = self.create_timer(self.timer_period, self.read_and_publish_sensors)
 
-        # Parameters
-        self.declare_parameter("reference_voltage", 3.3)
-        self.declare_parameter("divider_resistance", 47000.0)  # 47K ohm
-
-        # Initialize sequence counter for header
-        self.sequence_counter = 0
-
         self.get_logger().info("Flex sensor reader node initialized")
+
+    def random_and_publish_sensors(self):
+        resistance_values = []
+        msg = FlexSensorData()
+        current_time = time.time()
+
+        # Create and populate header with timestamp
+        msg.header = Header()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "flex_sensors"
+
+        # Generate sine wave for each channel (assuming 5 sensors)
+
+        for i in range(4):
+            # Each channel gets a different frequency and random amplitude
+            amplitude = random.uniform(20, 80)
+            frequency = 0.5 + i * 0.3  # Different frequency per channel
+            base_value = 200 + i * 50  # Different base resistance per channel
+
+            sine_value = (
+                amplitude * np.sin(2 * np.pi * frequency * current_time) + base_value
+            )
+            resistance_values.append(float(sine_value))
+
+        # Set the sensor data
+        msg.resistance_values = resistance_values
+
+        self.publisher_.publish(msg)
 
     def read_and_publish_sensors(self):
         try:
@@ -83,18 +124,15 @@ class FlexSensorReader(Node):
                     )
 
             # Create message with header (includes timestamp)
-            msg = ChannelFloat32()
-            
+            msg = FlexSensorData()
+
             # Create and populate header with timestamp
             msg.header = Header()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.header.frame_id = "flex_sensors"
-            msg.header.seq = self.sequence_counter
-            self.sequence_counter += 1
 
             # Set the sensor data
-            msg.name = "flex_sensor_resistance"
-            msg.values = resistance_values
+            msg.resistance_values = resistance_values
 
             self.publisher_.publish(msg)
 
@@ -102,15 +140,12 @@ class FlexSensorReader(Node):
             self.get_logger().error(f"Error reading sensors: {str(e)}")
 
             # Publish error message with timestamp
-            msg = ChannelFloat32()
+            msg = FlexSensorData()
             msg.header = Header()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.header.frame_id = "flex_sensors"
-            msg.header.seq = self.sequence_counter
-            self.sequence_counter += 1
-            
-            msg.name = "flex_sensor_resistance"
-            msg.values = [0.0, 0.0, 0.0, 0.0]
+
+            msg.resistance_values = [0.0, 0.0, 0.0, 0.0]
 
             self.publisher_.publish(msg)
 
