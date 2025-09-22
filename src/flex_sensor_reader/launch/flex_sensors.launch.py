@@ -10,12 +10,12 @@ def generate_launch_description():
             # Declare launch arguments
             DeclareLaunchArgument(
                 "sampling_rate",
-                default_value="50.0",
+                default_value="60.0",
                 description="Sampling rate for flex sensor processing",
             ),
             DeclareLaunchArgument(
                 "cutoff_frequency",
-                default_value="0.08",
+                default_value="0.8",
                 description="Butterworth filter cutoff frequency",
             ),
             DeclareLaunchArgument(

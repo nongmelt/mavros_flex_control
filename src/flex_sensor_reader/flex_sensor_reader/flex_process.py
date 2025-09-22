@@ -15,7 +15,7 @@ class FlexSensorProcessor(Node):
         super().__init__("flex_sensor_processor")
 
         # Declare parameters
-        self.declare_parameter("input_topic", "flex_sensors/fake_raw")
+        self.declare_parameter("input_topic", "flex_sensors/raw")
         self.declare_parameter("output_topic", "flex_sensors/processed")
         self.declare_parameter("buffer_size", 30)
         self.declare_parameter("sampling_rate", 18.0)  # Match your publisher rate
@@ -90,7 +90,7 @@ class FlexSensorProcessor(Node):
 
         # Create subscriber and publisher
         self.subscription = self.create_subscription(
-            Float32MultiArray, self.input_topic, self.sensor_callback, 10
+            FlexSensorData, self.input_topic, self.sensor_callback, 10
         )
 
         self.publisher = self.create_publisher(FlexSensorData, self.output_topic, 10)
@@ -120,13 +120,13 @@ class FlexSensorProcessor(Node):
 
     def sensor_callback(self, msg):
         """Main callback for processing incoming sensor data"""
-        if len(msg.data) != self.num_sensors:
+        if len(msg.resistance_values) != self.num_sensors:
             self.get_logger().warn(
-                f"Expected {self.num_sensors} sensors, got {len(msg.data)}"
+                f"Expected {self.num_sensors} sensors, got {len(msg.resistance_values)}"
             )
             return
 
-        raw_data = list(msg.data)
+        raw_data = list(msg.resistance_values)
         # Handle calibration phase
         if self.is_calibrating:
             self.collect_calibration_data(raw_data)
@@ -203,7 +203,7 @@ class FlexSensorProcessor(Node):
         self.publish_data(processed_data, self.filter_publisher)
 
         # Apply compensation
-        processed_data = self.apply_compensation(processed_data)
+        # processed_data = self.apply_compensation(processed_data)
 
         for i, value in enumerate(processed_data):
             self.data_buffers[i].append(value)
@@ -224,16 +224,14 @@ class FlexSensorProcessor(Node):
         return filtered_data
 
     def apply_compensation(self, data):
-        T_low, T_high = 80, 230
+        T_low, T_high = 160, 460
         beta = 0.35
         compensate_data = []
 
         for i, value in enumerate(data):
             prev_data = self.data_buffers[i][-1] if self.data_buffers[i] else 0.0
             dx = (value - prev_data) * self.sampling_rate
-            print(dx, i)
-
-            if (abs(value)) <= 0.03 * self.initial_baseline_values[i]:
+            if (abs(value)) <= 0.03 * self.baseline_values[i]:
                 if self.weight[i] == 1:  # after contact
                     raw = (abs(dx) - T_low) / max(T_high - T_low, 1e-6)
                     raw = np.clip(raw, 0, 1)
@@ -247,7 +245,6 @@ class FlexSensorProcessor(Node):
                 else:
                     self.weight[i] = 1
             compensate_data.append(value)
-        print()
         return compensate_data
 
     def publish_data(self, data, publisher):
